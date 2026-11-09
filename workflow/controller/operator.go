@@ -122,6 +122,8 @@ type wfOperationCtx struct {
 	// exportedNodes holds the nodes whose globalName outputs this operation
 	// has exported (exportNodeOutputs).
 	exportedNodes map[string]bool
+	// deferredCompletion is the completion markWorkflowPhase last held back, so it can be re-applied.
+	deferredCompletion *deferredWorkflowPhase
 	// execWf holds the Workflow for use in execution.
 	// In Normal workflow scenario: It holds copy of workflow object
 	// In Submit From WorkflowTemplate: It holds merged workflow with WorkflowDefault, Workflow and WorkflowTemplate
@@ -244,6 +246,7 @@ func (woc *wfOperationCtx) operate(ctx context.Context) {
 	ctx, err := woc.setExecWorkflow(ctx)
 	if err != nil {
 		woc.log.WithError(err).Error(ctx, "Unable to set ExecWorkflow")
+		woc.settleDeferredCompletion(ctx)
 		return
 	}
 	// For new workflows, create the workflow span first to ensure reconcileWorkflow
@@ -259,6 +262,7 @@ func (woc *wfOperationCtx) operate(ctx context.Context) {
 		ref, resolveErr := woc.controller.artifactRepositories.Resolve(reconcileCtx, woc.execWf.Spec.ArtifactRepositoryRef, woc.wf.Namespace)
 		if resolveErr != nil {
 			ctx = woc.markWorkflowError(ctx, fmt.Errorf("failed to resolve artifact repository: %w", resolveErr))
+			woc.settleDeferredCompletion(reconcileCtx)
 			return
 		}
 		woc.wf.Status.ArtifactRepositoryRef = ref
@@ -268,6 +272,7 @@ func (woc *wfOperationCtx) operate(ctx context.Context) {
 	repo, repoErr := woc.controller.artifactRepositories.Get(reconcileCtx, woc.wf.Status.ArtifactRepositoryRef)
 	if repoErr != nil {
 		woc.markWorkflowError(ctx, fmt.Errorf("failed to get artifact repository: %w", repoErr))
+		woc.settleDeferredCompletion(reconcileCtx)
 		return
 	}
 	woc.artifactRepository = repo
@@ -2626,6 +2631,7 @@ func (woc *wfOperationCtx) markWorkflowPhase(ctx context.Context, phase wfv1.Wor
 	if phase.Completed() && (woc.checkTaskResultsInProgress(ctx) || woc.hasDaemonNodes()) {
 		woc.log.WithFields(logging.Fields{"fromPhase": woc.wf.Status.Phase, "toPhase": phase}).
 			Debug(ctx, "taskresults of workflow are incomplete or still have daemon nodes, so can't mark workflow completed")
+		woc.deferredCompletion = &deferredWorkflowPhase{phase: phase, message: message}
 		woc.killDaemonedChildren(ctx, "")
 		return ctx
 	}
@@ -2818,6 +2824,32 @@ func (woc *wfOperationCtx) markWorkflowFailed(ctx context.Context, message strin
 
 func (woc *wfOperationCtx) markWorkflowError(ctx context.Context, err error) context.Context {
 	return woc.markWorkflowPhase(ctx, wfv1.WorkflowError, err.Error())
+}
+
+type deferredWorkflowPhase struct {
+	phase   wfv1.WorkflowPhase
+	message string
+}
+
+// settleDeferredCompletion reconciles task results and pods on an early return; a deferred completion can't land without them.
+func (woc *wfOperationCtx) settleDeferredCompletion(ctx context.Context) {
+	deferred := woc.deferredCompletion
+	if deferred == nil || woc.wf.Status.Phase.Completed() {
+		return
+	}
+	woc.taskResultReconciliation(ctx)
+	if completed, err := woc.podReconciliation(ctx); err != nil {
+		woc.log.WithError(err).Warn(ctx, "pod reconciliation failed while settling a deferred workflow completion")
+	} else if !completed {
+		woc.requeue()
+	}
+	// The workflow is ending, so stop every daemon, not only the root's: their boundaries won't complete to stop them.
+	for _, node := range woc.wf.Status.Nodes {
+		if node.IsDaemoned() {
+			woc.killDaemonedChildren(ctx, node.BoundaryID)
+		}
+	}
+	woc.markWorkflowPhase(ctx, deferred.phase, deferred.message)
 }
 
 // stepsOrDagSeparator identifies if a node name starts with our naming convention separator from
